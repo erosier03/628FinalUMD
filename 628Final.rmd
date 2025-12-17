@@ -1,0 +1,598 @@
+---
+title: "628Final"
+author: "Ethan Rosier"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+
+## Library Packages and Load Data
+
+## Library Packages needed 
+library(tidyverse)
+library(readr)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(gt)
+library(scales)
+library(sf)
+library(tigris)
+library(leaflet)
+library(usmap)
+library(plotly)
+library(ggrepel)
+library(gtExtras)
+
+
+## Load Data 
+house_election <- read_csv("election_results_house.csv")
+fec <- read_csv("2024fechousecands.csv")
+
+
+```
+
+
+Clean the FEC Data
+
+```{r}
+
+## Look at candidates that have raised over 1000 and have current candidate status 
+fec_clean <- fec |>
+  filter(receipts > 1000,
+         candidate_status == "C") |>
+   select(
+    candidate_id,
+    state,
+    district,
+    name,
+    party,
+    incumbent_challenge_full,
+    receipts,
+    disbursements,
+    cash_on_hand_end_period,
+    state_full) 
+
+
+## filter down to top two raisers for each district for each party 
+fec_clean <- fec_clean |>
+   group_by(state, district, party) |>
+  slice_max(order_by = receipts, n = 2, with_ties = FALSE) |>
+  ungroup()
+
+```
+
+Clean the House Election Data
+
+```{r}
+
+## Create at large states character 
+at_large_states <- c("AK","DE","ND","SD","VT","WY","DC")
+
+## Remove all but of Alaska's third ranked choice voting round 
+house_election <- house_election |>
+    filter(cycle == "2024") |>
+    filter(state != "Alaska" | ranked_choice_round == 3)
+
+
+## look at only 2024 candidates and remove N/A's and special elections (want to look at only nov 2024 elections) 
+house_clean <- house_election |>
+  filter(cycle == "2024") |>
+  filter(!is.na(candidate_name),
+         !is.na(ballot_party),
+         special == FALSE) |>
+  select(
+    id,
+    state, 
+    office_seat_name,
+    candidate_name,
+    ballot_party,
+    percent,
+    winner,
+    votes
+  )  |>
+  ## filter down to top two vote holders for each district 
+  group_by(state, office_seat_name) |>
+  slice_max(order_by = votes, n = 2, with_ties = FALSE) |>
+  distinct(candidate_name, .keep_all = TRUE) |>
+  ungroup() |>
+  
+## clean state and district for merging purposes
+  mutate(
+    state = state.abb[match(state, state.name)],
+    district = str_extract(office_seat_name, "\\d+"),
+    district = str_pad(district, 2, pad = "0"),
+    ## make at large states district "00" to match FEC data
+    district = if_else(state %in% at_large_states, "00", district)) 
+```
+
+Create a df with one row per district and merge with FEC data
+
+```{r}
+
+
+## sum district receipts and cash on hand for each district 
+district_totals <- fec_clean |>
+  group_by(state, district) |>
+ summarize(
+    district_receipts = sum(receipts, na.rm = TRUE),
+    district_COH = sum(cash_on_hand_end_period, na.rm = TRUE))
+
+## order candidates by state and district and the percent of vote they got
+house_ranked <- house_clean |>
+  group_by(state, district) |>
+  arrange(desc(percent), .by_group = TRUE) |>
+  mutate(
+    cand_rank = row_number()) |>
+  ungroup() |> 
+  ## removing non voting states like the Virgin Islands 
+  filter(!is.na(state))
+
+## Pivot and widen the house ranked data to get one row for each district 
+## Winner is candidate 1 and loser is candidate 2 
+house_wide <- house_ranked |>
+  select(state, district, cand_rank, candidate_name, percent, ballot_party) |>
+  pivot_wider(
+    names_from  = cand_rank,
+    values_from = c(candidate_name, percent, ballot_party),
+    names_glue  = "{.value}_{cand_rank}") |>
+    mutate(
+ 
+      ## Making sure its the right winner 
+  Winner_Name = case_when(
+      is.na(percent_2) ~ candidate_name_1,
+      percent_1 >= percent_2 ~ candidate_name_1,
+      TRUE ~ candidate_name_2),
+   ## Getting the right party 
+  Winner_Party = case_when(
+      is.na(percent_2) ~ ballot_party_1,
+      percent_1 >= percent_2 ~ ballot_party_1,
+      TRUE ~ ballot_party_2),
+    
+  ## Crate vote share of the winner as the higher percent 
+  Winner_Vote_Share = as.numeric(pmax(percent_1, percent_2, na.rm = TRUE)),
+
+  ## Vote share margin is winners percent - losers percent 
+  Vote_Share_Margin = as.numeric(percent_1 - percent_2)) |>
+  
+  ## Round to two digits for vote margin and percentage of vote won
+  mutate(across(where(is.numeric), \(x) round(x, 2))) |>
+  
+  ## set NA values to say NA
+  mutate(across(everything(), ~ ifelse(is.na(.x), "N/A", .x))) 
+
+
+## join my district totals with the election results 
+## this will show top two candidates and the total receipts and cash on hand for the district 
+## this includes non ballot day candidates that lost in the primary, but I am including this in the total receipts for the district as it impacts the cost of the race
+
+
+house_fec_merged <- house_wide|>
+  left_join(
+    district_totals,
+    by = c("state", "district")
+  ) 
+
+
+```
+
+
+
+Most Expensive House Races
+
+```{r}
+
+## Get the top 10 highest total receipt house races  
+most_expensive <- house_fec_merged |>
+  arrange(desc(district_receipts)) |>
+  slice(1:10) |>
+  mutate(
+    receipts = dollar(district_receipts),
+    cash_on_hand = dollar(district_COH)) |>
+  select(
+    state, district,
+    Winner = Winner_Name, 
+    Party = Winner_Party,
+    receipts, 
+    cash_on_hand = cash_on_hand,
+    Vote_Share = Winner_Vote_Share,
+    Margin = Vote_Share_Margin) 
+
+
+## Make the table for highest receipts 
+most_expensive |>
+  gt() |>
+  tab_header(
+    title = ("Top 10 Most Expensive House Races"),
+    subtitle = "Based on Total receipts") |>
+  cols_label(
+    state = "State",
+    district = "Distrct",
+    Winner = "Winner",
+    Party = "Party",
+    receipts = "Total Receipts",
+    Vote_Share = "Vote Share of Winner",
+    Margin = "Margin of Victory",
+    cash_on_hand = "Cash on Hand, EOC") |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()) |>
+  tab_options(
+    table.font.size = 12)
+
+```
+
+Closest Races
+
+```{r}
+
+## Get a df for the closest races by vote margin 
+closest_races <- house_fec_merged |>
+  arrange(Vote_Share_Margin) |>
+  slice(1:10)|> 
+  mutate(
+    district_receipts  = as.numeric(district_receipts),
+    Winner_Vote_Share  = as.numeric(Winner_Vote_Share),
+    Vote_Share_Margin  = as.numeric(Vote_Share_Margin)) |>
+  select(
+    state, district,
+    Winner = Winner_Name,
+    Winner_Party,
+    Vote_Share_Margin,
+    Winner_Vote_Share,
+    district_receipts)
+
+## make a scatter plot of the closest races
+ggplot(closest_races, aes(x = Vote_Share_Margin, y = district_receipts,
+            color = Winner_Party)) +
+  geom_point(size = 3) +
+  scale_color_manual(
+    values = c(
+      "DEM" = "blue",
+      "REP" = "red")) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Ten Closest House Races by Margin and Receipts",
+    x = "Vote Share Margin (%)",
+    y = "District Receipts ($)",
+    color = "Winner Party") +
+  geom_text_repel(
+    aes(label = Winner),
+    vjust = -.5,
+    size = 3,
+    show.legend = FALSE) +
+  theme_minimal()
+
+```
+
+Map with labels for each congressional district
+
+```{r}
+## Set cache options 
+options(tigris_use_cache = TRUE)
+options(tigris_class = "sf")
+
+# 2024 Congressional District Shapes 
+cd_shapes <- congressional_districts(cb = TRUE, year = 2024)
+
+## Match state codes to the map 
+data("fips_codes", package = "tigris")
+
+
+state_lookup <- fips_codes |>
+  distinct(state, state_code) |>
+  rename(state_abbr = state, state_fips = state_code)
+
+## Join location codes onto merged FEC data and assign geoid
+df_map <- house_fec_merged |>
+  left_join(state_lookup, by = c("state" = "state_abbr")) |>
+  mutate(GEOID = paste0(state_fips, district))
+
+
+cd_join <- cd_shapes |>
+  left_join(df_map, by = "GEOID")
+
+
+
+## create palette and binning for total receipts
+pal <- colorBin(
+  palette  = "YlGnBu",
+  domain   = cd_join$district_receipts,
+  bins     = 7,
+  na.color = "transparent")
+
+
+## make the interactive map using leaflet 
+fec_receipts_2024 <- leaflet(cd_join) |>
+  addProviderTiles("OpenStreetMap") |>
+  addPolygons(
+    fillColor = ~pal(district_receipts), weight = 0.5, color = "#555555",
+    fillOpacity = 0.8,
+    smoothFactor = 0.5,
+    highlightOptions = highlightOptions(
+      weight = 2,
+      color = "blue",
+      bringToFront = TRUE),
+    label = ~paste0(
+      state, "-", district, "<br>",
+      "Receipts: ", dollar(district_receipts)),
+    labelOptions = labelOptions(direction = "auto")) |>
+  addLegend(
+    pal = pal,
+    values = ~district_receipts,
+    position = "bottomright",
+    title = "Total District Receipts",
+    labFormat = labelFormat(prefix = "$", big.mark = ",")) |>
+    ## Have map open focused on 48 mainland states
+    fitBounds(lng1 = -125, lat1 = 25, lng2 = -66, lat2 = 49)
+
+
+fec_receipts_2024
+
+
+
+```
+
+Party Fundraising Differences for two main parties
+
+```{r}
+
+## get totals of fundraising for each party 
+party_totals <- fec_clean |>
+ mutate(
+    party_clean = case_when(
+      party %in% c("DEM", "DFL") ~ "DEM",
+      party == "REP" ~ "REP",
+      TRUE ~ "OTHER")) |>
+  group_by(party_clean) |>
+  filter(party_clean %in% c("DEM", "REP")) |>
+  summarize(
+    receipts = dollar(sum(receipts, na.rm = TRUE)),
+    cash_on_hand = dollar(sum(cash_on_hand_end_period, na.rm = TRUE)),
+    .groups = "drop") |>
+  rename(party = party_clean)
+
+
+## make the table of party totals 
+gt(party_totals) |>
+  tab_header(
+    title = "Democrat and Republican Fundraising Totals", 
+    subtitle = "Source: FEC Financial Disclosures") |>
+  cols_label(
+    party = "Party",
+    receipts = "Total Receipts",
+    cash_on_hand = "Cash on Hand") |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()) |> 
+  tab_options(
+    table.font.size = 13)
+
+
+```
+
+Average Margin of Victory vs Average Amount Raised for Each Party
+
+```{r}
+
+## Get the average amount raised for each party (including DFL as DEM)
+average_receipts <- fec_clean |>
+  mutate(
+    party = case_when(
+      party %in% c("DEM", "DFL") ~ "DEM",
+      party == "REP" ~ "REP",
+      TRUE ~ "OTHER")) |>
+  group_by(party) |>
+  filter(party %in% c("DEM", "REP")) |>
+  summarize(
+    avg_money = dollar(mean(receipts))
+  ) 
+
+
+## get the average win margin of each party
+average_margin <- house_fec_merged |>
+  filter(Winner_Party %in% c("DEM", "REP"),
+         !Vote_Share_Margin == "N/A",
+         !is.na(Vote_Share_Margin)) |>
+    mutate(
+    Vote_Share_Margin = as.numeric(Vote_Share_Margin)) |>
+  group_by(Winner_Party) |>
+  summarize(
+    avg_win_margin = round(mean(Vote_Share_Margin), digits = 2)) |>
+  rename(
+    "party" = Winner_Party)
+
+
+## join the averages into one df and make it into a table using gt 
+averages_joined <- left_join(x = average_receipts, y= average_margin,
+            by = "party") |>
+  gt() |>
+  tab_header(
+    title = "Comparison of Average Raised vs Average Win Margin") |>
+  cols_label(
+    party = "Party",
+    avg_money = "Average Receipts",
+    avg_win_margin= "Average Win Margin")
+
+averages_joined
+
+
+```
+
+House Leadership Table and Graph
+
+```{r}
+
+## Get rows of leadership districts from fec data and select the winners 
+leadership_rows <- fec_clean |>
+  filter(
+    (state == "LA" & district %in% c("04", "01")) |
+    (state == "MN" & district == "06") |
+    (state == "MI" & district == "09") |
+    (state == "NY" & district == "08") |
+    (state == "MA" & district == "05") |
+    (state == "CA" & district %in% c("33", "36"))
+  ) |>
+  slice(c(15,8,7,14,1,9,3,11))
+
+
+## Summarize leadersip fundraising amounts 
+leadership_summary <- leadership_rows |>
+  group_by(party) |>
+  summarize(
+    avg_receipts = mean(receipts, na.rm = TRUE),
+    avg_cash_on_hand = mean(cash_on_hand_end_period, na.rm = TRUE)
+  )
+
+
+## Make slight edits and use gt to make the table
+leadership_summary |>
+  mutate(
+    avg_receipts = dollar(avg_receipts),
+    avg_cash_on_hand = dollar(avg_cash_on_hand)) |>
+  gt() |>
+  tab_header(
+    title = "Leadership Fundraising Comparison: Democrats vs Republicans",
+    subtitle = "source: FEC") |>
+  cols_label(
+    party = "Party",
+    avg_receipts = "Average Receipts",
+    avg_cash_on_hand = "Average Cash on Hand")
+
+```
+
+
+Over and under fund-raised elections
+
+```{r}
+
+## Create a df that adds competitivness, level, and assessment to house_fec_merged
+
+fundraising <- house_fec_merged |>
+  mutate(
+    Vote_Share_Margin = abs(as.numeric(Vote_Share_Margin)),
+    
+    competitiveness = case_when(
+      Vote_Share_Margin < 5  ~ "Toss-up (<5%)",
+      Vote_Share_Margin < 12.5 ~ "Competitive (5–12.5%)",
+      TRUE  ~ "Uncompetitive (>12.5%)"),
+    
+    funding_level = case_when(
+      district_receipts < 5000000 ~ "Lower (<$5M)",
+      TRUE ~ "Higher (≥$5M)"),
+    
+    funding_assessment = case_when(
+      district_receipts < 5000000  & Vote_Share_Margin < 12.5 ~ "Underfunded",
+      district_receipts >= 5000000 & Vote_Share_Margin >= 12.5 ~ "Overfunded",
+      TRUE ~ "Normal"))
+
+## Look at overfunded and underfunded races only to plot 
+fundraising_plotting <- fundraising |>
+  filter(funding_assessment %in% c("Overfunded", "Underfunded")) |>
+  mutate(
+    Winner_Party = factor(Winner_Party, levels = c("DEM", "REP")))
+
+## Bar plot of a simple count for each funding level and winner by party
+fundraising_plotting |>
+  count(Winner_Party, funding_assessment) |>
+  ggplot(aes(x = Winner_Party, y = n, fill = funding_assessment)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(
+    values = c(
+      Overfunded = "darkblue",
+      Underfunded = "lightblue")) +
+  labs(
+    title = "Overfunded vs Underfunded Races by Winning Party",
+    x = "Winning Party",
+    y = "Number of races",
+    fill = "Funding category") +
+  theme_minimal()
+
+
+```
+
+Underfunded Races
+
+```{r}
+
+## look at only underfunded races 
+underfunded <- fundraising |>
+  filter(funding_assessment == "Underfunded")
+
+## plot each underfunded race with winner by party 
+ggplot(underfunded, aes(x = Vote_Share_Margin, y = district_receipts,
+           color = Winner_Party,
+           label = Winner_Name)) +
+  geom_point(size = 3, alpha = 0.9) +
+  geom_text_repel(size = 3, max.overlaps = 10) +
+  scale_y_continuous(labels = scales::dollar) +
+  scale_color_manual(values = c("DEM" = "blue",
+                                "REP" = "red")) +
+  labs(
+    title = "Underfunded House Races",
+    subtitle = "Low Funding (<$5M) and Competitive (<12.5%) Margins",
+    x = "Vote Share Margin (%)",
+    y = "District Receipts",
+    color = "Winner’s Party") +
+  theme_minimal()
+
+
+
+
+
+```
+
+Scatter plot of every race by district receipts and margin of victory
+
+```{r}
+## Create a margin plotting df for each race based on margin of victory and logged receipts 
+margin_plotting <- house_fec_merged |>
+    mutate(
+    receipts_log10 = log10(district_receipts)) 
+
+## plot the margin plotting df created above 
+ggplot(margin_plotting, aes(x = as.numeric(Vote_Share_Margin), y = receipts_log10,
+    color = Winner_Party)) +
+  geom_point(size = 1, alpha = 1) +
+  scale_color_manual(
+    values = c(
+      "DEM" = "blue",
+      "REP" = "red" )) +
+  labs(
+    title = "House Races: Fundraising vs. Margin of Victory",
+    x = "Vote Share Margin (percentage points)",
+    y = "Total District Receipts (Logged)",
+    color = "Winner Party") +
+  theme_minimal() +
+  geom_smooth(method = lm, se = FALSE)
+
+```
+
+Average Raised for an Incumbent vs Challenger
+
+```{r}
+## Get average incumbents and challengers receipts levels for each party 
+incumbent_or_challenger <- fec_clean |> 
+  filter(incumbent_challenge_full %in% c("Incumbent", "Challenger"),
+         party %in% c("DEM", "REP")) |>
+  group_by(party, incumbent_challenge_full) |>
+  summarize(
+    avg_receipts = dollar(mean(receipts, na.rm = TRUE)),
+    n = n(),
+   .groups = "drop")
+
+## put the df above into a table 
+incumbent_or_challenger |>
+  gt() |>
+  tab_header(
+    title = "Comparison of Average Raised for Incumbents and Challengers, by Party") |>
+  cols_label(
+    party = "Party",
+    avg_receipts = "Average receipts",
+    incumbent_challenge_full = "Incumbent or Challenger",
+    n= "Number of Candidates")
+
+
+
+```
